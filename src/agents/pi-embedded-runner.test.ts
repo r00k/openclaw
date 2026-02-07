@@ -9,9 +9,12 @@ import { ensureOpenClawModelsJson } from "./models-config.js";
 vi.mock("@mariozechner/pi-ai", async () => {
   const actual = await vi.importActual<typeof import("@mariozechner/pi-ai")>("@mariozechner/pi-ai");
 
-  const buildAssistantMessage = (model: { api: string; provider: string; id: string }) => ({
+  const buildAssistantMessage = (
+    model: { api: string; provider: string; id: string },
+    text = "ok",
+  ) => ({
     role: "assistant" as const,
-    content: [{ type: "text" as const, text: "ok" }],
+    content: [{ type: "text" as const, text }],
     stopReason: "stop" as const,
     api: model.api,
     provider: model.provider,
@@ -64,11 +67,17 @@ vi.mock("@mariozechner/pi-ai", async () => {
       if (model.id === "mock-error") {
         return buildAssistantErrorMessage(model);
       }
+      if (model.id === "gpt-4.1-mini") {
+        return buildAssistantMessage(model, "B");
+      }
       return buildAssistantMessage(model);
     },
     completeSimple: async (model: { api: string; provider: string; id: string }) => {
       if (model.id === "mock-error") {
         return buildAssistantErrorMessage(model);
+      }
+      if (model.id === "gpt-4.1-mini") {
+        return buildAssistantMessage(model, "B");
       }
       return buildAssistantMessage(model);
     },
@@ -81,7 +90,9 @@ vi.mock("@mariozechner/pi-ai", async () => {
           message:
             model.id === "mock-error"
               ? buildAssistantErrorMessage(model)
-              : buildAssistantMessage(model),
+              : model.id === "gpt-4.1-mini"
+                ? buildAssistantMessage(model, "B")
+                : buildAssistantMessage(model),
         });
         stream.end();
       });
@@ -539,5 +550,36 @@ describe("runEmbeddedPiAgent", () => {
 
     expect(result.meta.error).toBeUndefined();
     expect(result.payloads?.length ?? 0).toBeGreaterThan(0);
+  });
+  it("orchestrates with two planners and executes the judged winner", async () => {
+    const sessionFile = nextSessionFile();
+    const cfg = {
+      ...makeOpenAiConfig(["mock-1", "mock-2", "gpt-4.1-mini"]),
+      agents: {
+        defaults: {
+          model: {
+            primary: "openai/mock-1",
+            fallbacks: ["openai/mock-2"],
+          },
+        },
+      },
+    } satisfies OpenClawConfig;
+    await ensureModels(cfg);
+
+    const result = await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: testSessionKey,
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "pick the better plan",
+      provider: "openai",
+      model: "mock-1",
+      timeoutMs: 5_000,
+      agentDir,
+      enqueue: immediateEnqueue,
+    });
+
+    expect(result.meta.agentMeta?.model).toBe("mock-2");
   });
 });

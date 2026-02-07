@@ -56,6 +56,10 @@ import { describeUnknownError } from "./utils.js";
 
 type ApiKeyInfo = ResolvedProviderAuth;
 
+const ORCHESTRATOR_JUDGE_PROMPT = `You are choosing between two candidate assistant plans for the same user request.
+Return only "A" or "B" based on which candidate will better satisfy the user.
+Prioritize: instruction-following, correctness, safety, clarity, and actionability.`;
+
 // Avoid Anthropic's refusal test token poisoning session transcripts.
 const ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL = "ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL";
 const ANTHROPIC_MAGIC_STRING_REPLACEMENT = "ANTHROPIC MAGIC STRING TRIGGER REFUSAL (redacted)";
@@ -68,6 +72,65 @@ function scrubAnthropicRefusalMagic(prompt: string): string {
     ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL,
     ANTHROPIC_MAGIC_STRING_REPLACEMENT,
   );
+}
+
+function parseModelRef(ref: string | undefined): { provider: string; model: string } | undefined {
+  if (!ref) {
+    return undefined;
+  }
+  const trimmed = ref.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const slash = trimmed.indexOf("/");
+  if (slash <= 0 || slash === trimmed.length - 1) {
+    return undefined;
+  }
+  return {
+    provider: trimmed.slice(0, slash).trim(),
+    model: trimmed.slice(slash + 1).trim(),
+  };
+}
+
+function pickOrchestratorSecondaryModel(
+  params: RunEmbeddedPiAgentParams,
+): { provider: string; model: string } | undefined {
+  const primaryProvider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
+  const primaryModel = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+  const fallbacks = params.config?.agents?.defaults?.model?.fallbacks ?? [];
+  for (const fallback of fallbacks) {
+    const parsed = parseModelRef(fallback);
+    if (!parsed) {
+      continue;
+    }
+    if (parsed.provider === primaryProvider && parsed.model === primaryModel) {
+      continue;
+    }
+    return parsed;
+  }
+  return undefined;
+}
+
+function pickJudgeModel(params: RunEmbeddedPiAgentParams): { provider: string; model: string } {
+  const fromFallback = parseModelRef(params.config?.agents?.defaults?.model?.fallbacks?.[1]);
+  return fromFallback ?? { provider: "openai", model: "gpt-4.1-mini" };
+}
+
+function extractPrimaryText(result: EmbeddedPiRunResult): string {
+  return (
+    result.payloads
+      ?.map((payload) => payload.text ?? "")
+      .join("\n")
+      .trim() ?? ""
+  );
+}
+
+function choosePlannerWinner(vote: string): "A" | "B" {
+  const normalized = vote.trim().toUpperCase();
+  if (normalized.startsWith("B")) {
+    return "B";
+  }
+  return "A";
 }
 
 export async function runEmbeddedPiAgent(
@@ -88,6 +151,100 @@ export async function runEmbeddedPiAgent(
         : "plain"
       : "markdown");
   const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
+  const orchestrationMode = params.orchestrationMode ?? "auto";
+
+  if (orchestrationMode !== "off") {
+    const secondary = pickOrchestratorSecondaryModel(params);
+    if (secondary) {
+      const plannerPrompt = [
+        "Create a concise plan to answer the user request.",
+        "Focus on useful actions/tools and the final reply shape.",
+        "Do not execute tools.",
+        "User request:",
+        params.prompt,
+      ].join("\n\n");
+
+      const runPlanner = async (
+        label: "a" | "b",
+        provider: string,
+        model: string,
+      ): Promise<EmbeddedPiRunResult> =>
+        runEmbeddedPiAgent({
+          ...params,
+          sessionId: `${params.sessionId}:planner:${label}`,
+          sessionKey: `${params.sessionKey ?? params.sessionId}:planner:${label}`,
+          provider,
+          model,
+          prompt: plannerPrompt,
+          disableTools: true,
+          onPartialReply: undefined,
+          onAssistantMessageStart: undefined,
+          onBlockReply: undefined,
+          onBlockReplyFlush: undefined,
+          onReasoningStream: undefined,
+          onToolResult: undefined,
+          onAgentEvent: undefined,
+          orchestrationMode: "off",
+        });
+
+      const providerA = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
+      const modelA = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+      const planAResult = await runPlanner("a", providerA, modelA);
+      const planBResult = await runPlanner("b", secondary.provider, secondary.model);
+      const planA = extractPrimaryText(planAResult);
+      const planB = extractPrimaryText(planBResult);
+
+      let winner: "A" | "B" = "A";
+      try {
+        const judgeModel = pickJudgeModel(params);
+        const judgePrompt = [
+          `User request:
+${params.prompt}`,
+          `Candidate A (provider=${providerA} model=${modelA}):
+${planA || "(empty)"}`,
+          `Candidate B (provider=${secondary.provider} model=${secondary.model}):
+${planB || "(empty)"}`,
+          'Return only "A" or "B".',
+        ].join("\n\n");
+        const judgeResult = await runEmbeddedPiAgent({
+          ...params,
+          sessionId: `${params.sessionId}:judge`,
+          sessionKey: `${params.sessionKey ?? params.sessionId}:judge`,
+          provider: judgeModel.provider,
+          model: judgeModel.model,
+          prompt: judgePrompt,
+          extraSystemPrompt: ORCHESTRATOR_JUDGE_PROMPT,
+          disableTools: true,
+          onPartialReply: undefined,
+          onAssistantMessageStart: undefined,
+          onBlockReply: undefined,
+          onBlockReplyFlush: undefined,
+          onReasoningStream: undefined,
+          onToolResult: undefined,
+          onAgentEvent: undefined,
+          orchestrationMode: "off",
+        });
+        winner = choosePlannerWinner(extractPrimaryText(judgeResult));
+      } catch (err) {
+        log.warn(
+          `orchestrator judge failed, defaulting to planner A: ${describeUnknownError(err)}`,
+        );
+      }
+
+      const selected = winner === "B" ? secondary : { provider: providerA, model: modelA };
+      const selectedPlan = winner === "B" ? planB : planA;
+      return runEmbeddedPiAgent({
+        ...params,
+        provider: selected.provider,
+        model: selected.model,
+        prompt: `${params.prompt}
+
+Internal selected plan (do not quote verbatim):
+${selectedPlan}`,
+        orchestrationMode: "off",
+      });
+    }
+  }
 
   return enqueueSession(() =>
     enqueueGlobal(async () => {

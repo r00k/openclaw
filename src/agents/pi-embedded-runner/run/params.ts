@@ -102,4 +102,6 @@ export type RunEmbeddedPiAgentParams = {
   streamParams?: AgentStreamParams;
   ownerNumbers?: string[];
   enforceFinalTag?: boolean;
+  /** Internal: disable multi-model arbitration when running nested planner/judge attempts. */
+  orchestrationMode?: "auto" | "off";
 };
